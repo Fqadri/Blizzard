@@ -1,0 +1,69 @@
+# ---- Go build output ----
+# Compiled binaries and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Binary named after the module, built with `go build` in the repo root
+/blizzard
+/blizzard.exe
+/bin/
+/dist/
+
+# Go workspace file (usually machine-specific)
+go.work
+go.work.sum
+
+# Dependency directory (only used with the legacy vendor workflow)
+# Delete the next line if you intend to commit vendored dependencies.
+/vendor/
+
+# ---- Test & profiling artifacts ----
+coverage.out
+coverage.html
+*.cover
+*.prof
+*.pprof
+*.trace
+__debug_bin*
+fuzz/
+testdata/tmp/
+
+# ---- Environment & secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Editors & IDEs ----
+*.code-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS noise ----
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+# macOS
+.DS_Store
+# Linux
+.directory
+
+# ---- Logs & temp ----
+*.log
+tmp/
+temp/
