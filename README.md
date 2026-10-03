@@ -1,6 +1,6 @@
 # Blizzard
 
-An LLM inference server written in Go. It accepts prompts over HTTP, schedules them with continuous batching, and streams generated tokens back over Server-Sent Events. A Python worker process runs the model with Hugging Face `transformers`.
+An LLM inference server written in Go. It accepts prompts over HTTP, schedules them with continuous batching, and streams generated tokens back over Server-Sent Events. A Python worker process loads and executes any HF Causal Language model.
 
 ## How it works
 
@@ -31,7 +31,7 @@ uv sync
 cd ..
 ```
 
-**2. Start the server** from the repo root:
+**2. Start the inferencing server** from the repo root:
 
 ```powershell
 $env:BLIZZARD_PYTHON = "$PWD\python\.venv\Scripts\python.exe"   # Linux: $PWD/python/.venv/bin/python
