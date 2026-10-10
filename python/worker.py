@@ -1,7 +1,7 @@
-"""Blizzard model worker: runs one forward step per request over a JSON-lines protocol.
+"""
+Model Worker that wraps Hugging face transfomers library for inference.
 
-The parent writes one request per line to stdin and reads exactly one reply per request from
-the original stdout. Closing stdin is the shutdown signal.
+Exposes stdio interface for communication with the parent process.
 """
 
 import os
@@ -33,10 +33,11 @@ def send(msg: dict[str, Any]) -> None:
     _protocol.flush()
 
 
+# Represents internal state of a single sequence being processed by the model.
 @dataclass
 class SeqState:
-    # Token IDs the model has produced so far. Each step appends one. The last one is not in the KV cache yet:
-    # it is the input of the next decode step. It is also checked against the end-of-text tokens to set done.
+    # cache of token IDs the model has produced so far so that the caller does not have to resend the entire text each step.
+    # The last one is not in the KV cache yet: it is the input of the next decode step. It is also checked against the end-of-text tokens to set done.
     generated: list[int]
     # text already sent; a token that ends mid-character sends nothing until the next one completes it so this is used to track what was the last token sent back to Go.
     emitted: str = ""
@@ -59,9 +60,8 @@ class Worker:
         pad = self.tokenizer.pad_token_id
         self.pad_id = pad if pad is not None else next(iter(self.eos_ids), 0)
 
-        # Join and trim edit each layer's K/V tensors directly, which is only valid for plain full-attention layers.
-        # Other layer types (sliding window, quantized, linear attention) keep extra state those edits would
-        # silently corrupt, producing wrong text rather than an error.
+        # K/V tensors needs to be adjusted based on the active rows, which can only work for plain full-attention layers.
+        # Other layer types (sliding window, quantized, linear attention) keep extra state those edits would silently corrupt, producing wrong text rather than an error.
         layer_types = {type(layer) for layer in DynamicCache(config=self.model.config).layers}
         if layer_types - {DynamicLayer}:
             names = sorted(t.__name__ for t in layer_types)
@@ -90,11 +90,12 @@ class Worker:
         if missing := running - self.seqs.keys():
             raise LookupError(f"sequences {sorted(missing)} have no state and no prompt")
 
-        # any id missing from the batch has finished or been cancelled, so forget it
+        # any id cached on worker side but missing from the batch means it has finished or been cancelled so drop it from the cache.
         for seq_id in self.seqs.keys() - running:
             del self.seqs[seq_id]
         self._keep_rows([i for i, seq_id in enumerate(self.rows) if seq_id in running])
 
+        # keep only the rows corresponding to running sequences in the shared cache
         if self.rows:
             self._decode()
         if new:

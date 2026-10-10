@@ -61,26 +61,29 @@ func run() error {
 	executor := modelexecutor.New(worker, stepTimeout)
 	engine := llmengine.New(queue, executor, maxTokens)
 
-	// this will run the engine in a separate goroutine
-	go func() {
-		if err := engine.Run(ctx, maxBatchSize); err != nil {
-			log.Printf("blizzard: engine stopped unexpectedly: %v", err)
-		}
-	}()
+	// run the engine in a separate goroutine
+	engineErr := make(chan error, 1)
+	go func() { engineErr <- engine.Run(ctx, maxBatchSize) }()
 
+	// run the server in a separate goroutine
 	server := apiserver.New(engine)
-
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.Serve(listener) }()
 
 	log.Printf("blizzard: listening on %s", listenAddr)
 
 	// wait for either the server
-	// 1. to return an error or
-	// 2. for a termination signal
+	// 1. server to return an error or
+	// 2. engine to return an error or stop unexpectedly
+	// 3. for a termination signal
 	select {
 	case err := <-serverErr:
 		return err
+	case err := <-engineErr:
+		if ctx.Err() == nil { // nil only means a clean exit during shutdown
+			return fmt.Errorf("engine stopped unexpectedly: %w", err)
+		}
+		return nil
 	case <-ctx.Done():
 		log.Print("blizzard: shutting down")
 		return nil
