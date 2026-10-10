@@ -97,7 +97,8 @@ func (server *Server) handleStreamGenerate(writer http.ResponseWriter, request *
 				return
 			}
 
-			slog.Error("stream receive failed", "error", err, "finish_reason", tokens.Reason())
+			// Info, not Error: the engine logs root causes where they happen, and shutdown also ends streams this way
+			slog.Info("stream ended with error", "error", err, "finish_reason", tokens.Reason())
 			writeTerminalEvent(writer, controller, "error", terminalEvent{
 				FinishReason: tokens.Reason(),
 				Error:        "generation failed",

@@ -193,6 +193,7 @@ func (e *engine) deliver(
 				case errors.Is(err, stream.ErrStreamClosed):
 					// cancel hook already terminated it; the first reason wins
 				default:
+					slog.Error("send to client stream failed", "error", err, "seq_id", seq.ID)
 					e.terminate(seq, FinishReasonError, err) // safety net for future
 				}
 				continue
