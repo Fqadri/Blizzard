@@ -18,7 +18,29 @@ HTTP client ──► apiserver ──► scheduler ──► llmengine ──�
 | `internal/stream` | Non-blocking token channel between the engine and each HTTP handler |
 | `internal/modelexecutor` | Step protocol: sends each prompt once, then only sequence IDs; detects out-of-sync replies |
 | `internal/modelworker` | Starts and stops the Python process; JSON request/response over stdin/stdout |
-| `python/worker.py` | Loads the model, keeps each sequence's token IDs, and runs one padded, batched forward pass per step (no KV cache yet) |
+| `python/worker.py` | Loads the model, holds one KV cache shared by all running sequences, and decodes them in one batched forward pass per step |
+
+### Model worker: batching and KV cache
+
+The worker keeps a single KV cache for the whole batch, one row per running sequence. Rows have different lengths, so shorter rows are left-padded and a mask marks which columns are real tokens:
+
+```
+row A:  a1 a2 a3 a4 a5     mask 1 1 1 1 1
+row B:  0  0  0  b1 b2          0 0 0 1 1
+```
+
+Each step:
+
+1. **Leave**: rows for finished or cancelled sequences are dropped, and leading columns that are padding in every row are trimmed.
+2. **Decode**: every running sequence generates one token in a single `[rows, 1]` forward pass over the shared cache.
+3. **Prefill**: new prompts run as one padded batch in a separate forward pass, which also produces their first token.
+4. **Join**: the new rows are left-padded to the cache width (or the cache to theirs) and appended.
+
+Limitations:
+
+- Only full-attention models are supported; the worker refuses sliding-window and other cache layer types at startup.
+- While a new prompt is prefilled, running streams pause for that step (about 2 s on CPU for Qwen2.5-1.5B). Chunked prefill is planned.
+- Decoding is greedy.
 
 ## Run locally
 
@@ -67,7 +89,7 @@ The response is a stream of `data: {"generated_text": "..."}` events, ending wit
 |---|---|---|
 | `BLIZZARD_PYTHON` | `python` | Python interpreter; point it at the venv |
 | `BLIZZARD_WORKER` | `python/worker.py` | Worker script path |
-| `BLIZZARD_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | Hugging Face model ID |
+| `BLIZZARD_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | Hugging Face model ID (full-attention models only) |
 | `HF_HUB_OFFLINE` | unset | Set to `1` once the model is cached, to skip network checks at startup |
 
 The listen address, queue size, batch size, and token limit are constants in `cmd/main.go`.
