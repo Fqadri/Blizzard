@@ -1,11 +1,12 @@
 # Blizzard
 
-An LLM inference server written in Go. It accepts prompts over HTTP, schedules them with continuous batching, and streams generated tokens back over Server-Sent Events. A Python worker process loads and executes any HF Causal Language model.
+An LLM inference server written in Go. It accepts prompts over HTTP, schedules them with continuous batching, and streams generated tokens back over Server-Sent Events. 
+A Python worker process, wraps the Hugging Face Transformers library for actual inference, and uses stdin and stdout to communicate with LLM engine.
 
 ## How it works
 
 ```
-HTTP client ──► apiserver ──► scheduler ──► llmengine ──► modelexecutor ──► modelworker ──► python/worker.py
+HTTP client ──► apiserver ──► scheduler ──► llmengine ──► modelexecutor ──► modelworker ──► python/worker.py(worker process)
    ◄──── SSE tokens ◄──── stream ◄─────────────┘
 ```
 
@@ -17,7 +18,7 @@ HTTP client ──► apiserver ──► scheduler ──► llmengine ──�
 | `internal/stream` | Non-blocking token channel between the engine and each HTTP handler |
 | `internal/modelexecutor` | Step protocol: sends each prompt once, then only sequence IDs; detects out-of-sync replies |
 | `internal/modelworker` | Starts and stops the Python process; JSON request/response over stdin/stdout |
-| `python/worker.py` | Loads the model, holds the KV cache per sequence, and generates one token per sequence per step |
+| `python/worker.py` | Loads the model, keeps each sequence's token IDs, and runs one padded, batched forward pass per step (no KV cache yet) |
 
 ## Run locally
 
