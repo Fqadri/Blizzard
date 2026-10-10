@@ -7,7 +7,7 @@ import (
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/stream_generate", s.handleStreamGenerate)
+	mux.HandleFunc("POST /stream_generate", s.handleStreamGenerate)
 
 	return mux
 }
