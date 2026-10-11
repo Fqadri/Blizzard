@@ -43,10 +43,11 @@ func run() error {
 	}
 	defer listener.Close()
 
+	model := envOr("BLIZZARD_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 	worker := modelworker.New(modelworker.Config{
 		Python:       envOr("BLIZZARD_PYTHON", "python"),
 		Script:       envOr("BLIZZARD_WORKER", "python/worker.py"),
-		Args:         []string{"--model", envOr("BLIZZARD_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")},
+		Args:         []string{"--model", model},
 		StartTimeout: startTimeout,
 	})
 
@@ -66,7 +67,7 @@ func run() error {
 	go func() { engineErr <- engine.Run(ctx, maxBatchSize) }()
 
 	// run the server in a separate goroutine
-	server := apiserver.New(engine)
+	server := apiserver.New(engine, apiserver.Config{Model: model, MaxTokens: maxTokens})
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.Serve(listener) }()
 

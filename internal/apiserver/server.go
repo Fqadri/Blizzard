@@ -7,9 +7,15 @@ import (
 	"time"
 )
 
+type Config struct {
+	Model     string // served model; requests naming any other model get 404
+	MaxTokens int    // largest max_tokens a request may ask for
+}
+
 type Server struct {
 	httpServer *http.Server
 	generator  Generator
+	config     Config
 }
 
 // Serve accepts connections on ln until the server is shut down.
@@ -25,8 +31,8 @@ func (server *Server) Shutdown(ctx context.Context) error {
 	return server.httpServer.Shutdown(ctx)
 }
 
-func New(generator Generator) *Server {
-	server := &Server{generator: generator}
+func New(generator Generator, config Config) *Server {
+	server := &Server{generator: generator, config: config}
 	server.httpServer = &http.Server{
 		Handler:           server.routes(),
 		ReadHeaderTimeout: 5 * time.Second,

@@ -50,6 +50,8 @@ class Worker:
 
         # load the tokenizer and model for the given model ID
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if not self.tokenizer.chat_template:
+            raise ValueError(f"{model_id} has no chat template, which chat completions need")
         self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(self.device)
         self.model.eval()
 
@@ -84,11 +86,11 @@ class Worker:
 
     @torch.inference_mode()
     def step(self, seqs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        # a prompt always means start over, discarding any existing state
-        new = {s["id"]: self._tokenize(s["prompt"]) for s in seqs if s.get("prompt")}
+        # messages always mean start over, discarding any existing state
+        new = {s["id"]: self._tokenize(s["messages"]) for s in seqs if s.get("messages")}
         running = {s["id"] for s in seqs} - new.keys()
         if missing := running - self.seqs.keys():
-            raise LookupError(f"sequences {sorted(missing)} have no state and no prompt")
+            raise LookupError(f"sequences {sorted(missing)} have no state and no messages")
 
         # any id cached on worker side but missing from the batch means it has finished or been cancelled so drop it from the cache.
         for seq_id in self.seqs.keys() - running:
@@ -201,15 +203,8 @@ class Worker:
                 layer.values = layer.values[:, :, start:]
             self.mask = self.mask[:, start:]
 
-    def _tokenize(self, prompt: str) -> list[int]:
-        if self.tokenizer.chat_template:
-            # instruct models only emit end-of-turn when the prompt is framed as a chat turn
-            return self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                return_dict=True,
-            )["input_ids"]
-        return self.tokenizer(prompt).input_ids
+    def _tokenize(self, messages: list[dict[str, str]]) -> list[int]:
+        return self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=True)["input_ids"]
 
     def _pad_batch(self, rows: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Left-pads token rows into one batch so a single forward pass serves every sequence.

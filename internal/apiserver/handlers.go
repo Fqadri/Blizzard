@@ -2,15 +2,16 @@ package apiserver
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/fqadri/blizzard/internal/chat"
 	stream "github.com/fqadri/blizzard/internal/stream"
 )
 
@@ -18,25 +19,14 @@ import (
 const writeTimeout = 30 * time.Second
 
 type Generator interface {
-	GenerateStream(ctx context.Context, prompt string) (stream.Stream, error)
-}
-
-type generateRequest struct {
-	Prompt string `json:"prompt"`
-}
-
-type generateResponse struct {
-	GeneratedText string `json:"generated_text"`
-}
-
-type terminalEvent struct {
-	FinishReason string `json:"finish_reason"`
-	Error        string `json:"error,omitempty"`
+	GenerateStream(
+		ctx context.Context,
+		messages []chat.Message,
+		maxTokens int) (stream.Stream, error)
 }
 
 // writeEvent writes and flushes one SSE event under a write deadline.
-// The deadline is cleared afterwards so time spent waiting for the next token isn't counted:
-// once a deadline has passed it can't be extended, which would kill a stream still queued for its first token.
+// we are doing this to ensure that each write has a bounded time to complete, preventing a slow client from blocking indefinitely.
 func writeEvent(writer http.ResponseWriter, controller *http.ResponseController, event string) error {
 	if err := controller.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		return err
@@ -47,38 +37,87 @@ func writeEvent(writer http.ResponseWriter, controller *http.ResponseController,
 	if err := controller.Flush(); err != nil {
 		return err
 	}
+
+	// clear the write deadline so that subsequent writes aren't prematurely timed out
 	return controller.SetWriteDeadline(time.Time{})
 }
 
-// status is already sent by this point, so completion and failure can only be signaled in-band
-func writeTerminalEvent(writer http.ResponseWriter, controller *http.ResponseController, name string, event terminalEvent) {
-	payload, err := json.Marshal(event)
+// status is already sent by this point, so failure can only be signaled in-band, as a data line holding an error object
+func writeStreamError(writer http.ResponseWriter, controller *http.ResponseController, message string) {
+	payload, err := json.Marshal(errorResponse{Error: errorInfo{Message: message, Type: "server_error"}})
 	if err != nil {
-		slog.Error("encode terminal event failed", "error", err)
+		slog.Error("encode stream error failed", "error", err)
 		return
 	}
 
-	_ = writeEvent(writer, controller, fmt.Sprintf("event: %s\ndata: %s\n\n", name, payload))
+	if writeEvent(writer, controller, fmt.Sprintf("data: %s\n\n", payload)) == nil {
+		_ = writeEvent(writer, controller, "data: [DONE]\n\n")
+	}
 }
 
-// handleStreamGenerate handles streaming generation requests using Server's generator.
-func (server *Server) handleStreamGenerate(writer http.ResponseWriter, request *http.Request) {
+func writeChunk(writer http.ResponseWriter, controller *http.ResponseController, chunk chatCompletionChunk, choice chunkChoice) error {
+	chunk.Choices = []chunkChoice{choice}
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+	return writeEvent(writer, controller, fmt.Sprintf("data: %s\n\n", payload))
+}
+
+// handleChatCompletions serves OpenAI chat completions; only streaming responses are supported so far.
+func (server *Server) handleChatCompletions(writer http.ResponseWriter, request *http.Request) {
 	request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
 
-	var input generateRequest
+	var input chatCompletionRequest
 	if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
 		http.Error(writer, "invalid JSON request", http.StatusBadRequest)
 		return
 	}
 
-	if strings.TrimSpace(input.Prompt) == "" {
-		http.Error(writer, "prompt is required", http.StatusBadRequest)
+	if input.Model == "" {
+		http.Error(writer, "model is required", http.StatusBadRequest)
+		return
+	}
+	if input.Model != server.config.Model {
+		http.Error(writer, fmt.Sprintf("model %q not found", input.Model), http.StatusNotFound)
+		return
+	}
+
+	// stream defaults to false in the spec, so an omitted stream also asks for a single JSON response
+	if !input.Stream {
+		http.Error(writer, `only streaming is supported: set "stream": true`, http.StatusBadRequest)
+		return
+	}
+
+	if len(input.Messages) == 0 {
+		http.Error(writer, "messages is required", http.StatusBadRequest)
+		return
+	}
+	for i, message := range input.Messages {
+		switch message.Role {
+		case "system", "user", "assistant":
+		default:
+			http.Error(writer, fmt.Sprintf("messages[%d]: role %q is not supported; use system, user or assistant", i, message.Role), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// chat completions have no default length, so an unset limit means the server's cap
+	maxTokens := server.config.MaxTokens
+	switch {
+	case input.MaxCompletionTokens != nil:
+		maxTokens = *input.MaxCompletionTokens
+	case input.MaxTokens != nil:
+		maxTokens = *input.MaxTokens
+	}
+	if maxTokens < 1 || maxTokens > server.config.MaxTokens {
+		http.Error(writer, fmt.Sprintf("max_completion_tokens must be between 1 and %d", server.config.MaxTokens), http.StatusBadRequest)
 		return
 	}
 
 	ctx := request.Context()
 
-	tokens, err := server.generator.GenerateStream(ctx, input.Prompt)
+	tokenStream, err := server.generator.GenerateStream(ctx, input.Messages, maxTokens)
 	if err != nil {
 		slog.Error("generation failed", "error", err)
 		// todo: GenerateStream can fail for queue full which should be handled separately
@@ -98,6 +137,20 @@ func (server *Server) handleStreamGenerate(writer http.ResponseWriter, request *
 		return
 	}
 
+	// every chunk of one completion shares its id, timestamp and model
+	chunk := chatCompletionChunk{
+		ID:      "chatcmpl-" + rand.Text(),
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   server.config.Model,
+	}
+
+	// like OpenAI, the first chunk announces the assistant role with empty content
+	empty := ""
+	if err := writeChunk(writer, controller, chunk, chunkChoice{Delta: delta{Role: "assistant", Content: &empty}}); err != nil {
+		return
+	}
+
 	for {
 		// first check if the context has been canceled before attempting to receive the next token
 		select {
@@ -106,36 +159,27 @@ func (server *Server) handleStreamGenerate(writer http.ResponseWriter, request *
 		default:
 		}
 
-		token, err := tokens.Recv(ctx)
+		token, err := tokenStream.Recv(ctx)
 		if err != nil {
-			if ctx.Err() != nil { // client is gone, nothing left to write to
+			if ctx.Err() != nil { // context error: client is gone, nothing left to write to
 				return
 			}
+
 			if errors.Is(err, io.EOF) { // this indicates the stream has been closed
-				writeTerminalEvent(writer, controller, "done", terminalEvent{FinishReason: tokens.Reason()})
+				reason := tokenStream.Reason()
+				if writeChunk(writer, controller, chunk, chunkChoice{FinishReason: &reason}) == nil {
+					_ = writeEvent(writer, controller, "data: [DONE]\n\n")
+				}
 				return
 			}
 
 			// Info, not Error: the engine logs root causes where they happen, and shutdown also ends streams this way
-			slog.Info("stream ended with error", "error", err, "finish_reason", tokens.Reason())
-			writeTerminalEvent(writer, controller, "error", terminalEvent{
-				FinishReason: tokens.Reason(),
-				Error:        "generation failed",
-			})
+			slog.Info("stream ended with error", "error", err, "finish_reason", tokenStream.Reason())
+			writeStreamError(writer, controller, "generation failed")
 			return
 		}
 
-		payload, err := json.Marshal(generateResponse{GeneratedText: token})
-		if err != nil {
-			slog.Error("encode token failed", "error", err)
-			writeTerminalEvent(writer, controller, "error", terminalEvent{
-				FinishReason: "error",
-				Error:        "generation failed",
-			})
-			return
-		}
-
-		if err := writeEvent(writer, controller, fmt.Sprintf("data: %s\n\n", payload)); err != nil {
+		if err := writeChunk(writer, controller, chunk, chunkChoice{Delta: delta{Content: &token}}); err != nil {
 			return
 		}
 	}

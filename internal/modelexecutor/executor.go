@@ -6,29 +6,30 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/fqadri/blizzard/internal/chat"
 	"github.com/fqadri/blizzard/internal/llmengine"
 )
 
 var errWorkerDown = errors.New("modelexecutor: worker is not running")
 
-// stepRequest is one request sent to the worker. A sequence carries its prompt only on its
+// stepRequest is one request sent to the worker. A sequence carries its messages only on its
 // first step; the worker holds state for it afterwards, and frees state for any id absent
 // from seqs.
 //
-//	{"step":42,"seqs":[{"id":1,"prompt":"Explain gravity"},{"id":2}]}
+//	{"step":42,"seqs":[{"id":1,"messages":[{"role":"user","content":"Explain gravity"}]},{"id":2}]}
 type stepRequest struct {
 	Step uint64    `json:"step"` // the current step number of the sequence batch. helps in validating desynced replies
 	Seqs []wireSeq `json:"seqs"`
 }
 
-// Prompt is present only on the sequence's first step. A request carrying a prompt makes the
+// Messages are present only on the sequence's first step. A request carrying messages makes the
 // worker (re)prefill that sequence from scratch, discarding any state it already held for it.
 //
-//	{"id":1,"prompt":"Explain gravity"}   first appearance
-//	{"id":2}                              already cached
+//	{"id":1,"messages":[{"role":"user","content":"Explain gravity"}]}   first appearance
+//	{"id":2}                                                            already cached
 type wireSeq struct {
-	ID     uint64 `json:"id"`
-	Prompt string `json:"prompt,omitempty"`
+	ID       uint64         `json:"id"`
+	Messages []chat.Message `json:"messages,omitempty"`
 }
 
 // stepResponse is the worker's reply. Step echoes the request so a desynced transport is
@@ -72,12 +73,12 @@ func New(w worker, timeout time.Duration) *Executor {
 }
 
 // ExecuteStep runs one forward pass over the batch and returns one result per input sequence.
-// A sequence carries its prompt only on its first step. After that the worker holds token ids it generated,
+// A sequence carries its messages only on its first step. After that the worker holds token ids it generated,
 // keyed by sequence ID, so later steps need only the id:
 //
-//	step 1:  {"id":1,"prompt":"Explain gravity"}   → "Grav"   (prefill)
-//	step 2:  {"id":1}                              → "ity"    (decode from cache)
-//	step 3:  {"id":1}                              → " is"    (decode from cache)
+//	step 1:  {"id":1,"messages":[...]}   → "Grav"   (prefill)
+//	step 2:  {"id":1}                    → "ity"    (decode from cache)
+//	step 3:  {"id":1}                    → " is"    (decode from cache)
 //
 // The worker frees state for any id absent from the batch, so a sequence that finished or was cancelled needs no explicit removal.
 //
@@ -99,11 +100,11 @@ func (e *Executor) ExecuteStep(ctx context.Context, seqs []*llmengine.Sequence) 
 	req := stepRequest{Step: e.step, Seqs: make([]wireSeq, 0, len(seqs))}
 	currentSequences := make(map[uint64]struct{}, len(seqs))
 
-	// append all sequences to the request, sending the prompt only for sequences not in the cache
+	// append all sequences to the request, sending the messages only for sequences not in the cache
 	for _, seq := range seqs {
 		ws := wireSeq{ID: seq.ID}
 		if _, ok := e.cached[seq.ID]; !ok {
-			ws.Prompt = seq.Prompt // send prompt only for first occurrence
+			ws.Messages = seq.Messages // send messages only for first occurrence
 		}
 		currentSequences[seq.ID] = struct{}{}
 		req.Seqs = append(req.Seqs, ws)

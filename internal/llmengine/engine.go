@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/fqadri/blizzard/internal/chat"
 	stream "github.com/fqadri/blizzard/internal/stream"
 )
 
@@ -44,10 +45,11 @@ type scheduler interface {
 }
 
 type Sequence struct {
-	ID     uint64
-	Prompt string        // original prompt
-	Output []string      // only the length is used; the tokens are retained for diagnostics
-	Stream stream.Stream // where the engine sends each token; the handler holds the receive side
+	ID        uint64
+	Messages  []chat.Message // the conversation to continue
+	MaxTokens int            // generation cap for this sequence
+	Output    []string       // only the length is used; the tokens are retained for diagnostics
+	Stream    stream.Stream  // where the engine sends each token; the handler holds the receive side
 
 	terminateOnce sync.Once   // ensures that the sequence is only terminated once
 	closed        atomic.Bool // indicates whether the sequence has been closed
@@ -57,7 +59,7 @@ type engine struct {
 	modelExecutor modelExecutor
 	scheduler     scheduler
 	seqID         atomic.Uint64 // monotonically increasing identifier for the sequence
-	maxTokens     int           // maximum number of tokens to generate per sequence
+	maxTokens     int           // upper bound for any sequence's MaxTokens
 }
 
 func (e *engine) nextID() uint64 {
@@ -71,12 +73,17 @@ func New(
 	return &engine{scheduler: scheduler, modelExecutor: modelExecutor, maxTokens: maxTokens}
 }
 
-// GenerateStream generates a stream for the given prompt
-func (e *engine) GenerateStream(ctx context.Context, prompt string) (stream.Stream, error) {
-	seq := &Sequence{ // encapsulate the request prompt into an input sequence object
-		ID:     e.nextID(),
-		Prompt: prompt,
-		Stream: stream.NewChannelStream(),
+// GenerateStream generates up to maxTokens tokens of the assistant's reply to messages
+func (e *engine) GenerateStream(ctx context.Context, messages []chat.Message, maxTokens int) (stream.Stream, error) {
+	if maxTokens <= 0 || maxTokens > e.maxTokens { // the API validates max_tokens; this is a backstop
+		maxTokens = e.maxTokens
+	}
+
+	seq := &Sequence{ // encapsulate the request into an input sequence object
+		ID:        e.nextID(),
+		Messages:  messages,
+		MaxTokens: maxTokens,
+		Stream:    stream.NewChannelStream(),
 	}
 
 	if err := e.scheduler.Submit(seq); err != nil { // put it on the scheduler
@@ -206,7 +213,7 @@ func (e *engine) deliver(
 		switch {
 		case res.Done: // 3. sequence has completed normally
 			e.terminate(seq, FinishReasonStop, nil)
-		case len(seq.Output) >= e.maxTokens: // 4. sequence has reached the maximum allowed token length
+		case len(seq.Output) >= seq.MaxTokens: // 4. sequence has reached its max_tokens
 			e.terminate(seq, FinishReasonLength, nil)
 		default:
 			kept = append(kept, seq)
