@@ -9,9 +9,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	stream "github.com/fqadri/blizzard/internal/stream"
 )
+
+// how long one write may block on a client that stopped reading; like nginx send_timeout
+const writeTimeout = 30 * time.Second
 
 type Generator interface {
 	GenerateStream(ctx context.Context, prompt string) (stream.Stream, error)
@@ -30,6 +34,22 @@ type terminalEvent struct {
 	Error        string `json:"error,omitempty"`
 }
 
+// writeEvent writes and flushes one SSE event under a write deadline.
+// The deadline is cleared afterwards so time spent waiting for the next token isn't counted:
+// once a deadline has passed it can't be extended, which would kill a stream still queued for its first token.
+func writeEvent(writer http.ResponseWriter, controller *http.ResponseController, event string) error {
+	if err := controller.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(writer, event); err != nil {
+		return err
+	}
+	if err := controller.Flush(); err != nil {
+		return err
+	}
+	return controller.SetWriteDeadline(time.Time{})
+}
+
 // status is already sent by this point, so completion and failure can only be signaled in-band
 func writeTerminalEvent(writer http.ResponseWriter, controller *http.ResponseController, name string, event terminalEvent) {
 	payload, err := json.Marshal(event)
@@ -38,8 +58,7 @@ func writeTerminalEvent(writer http.ResponseWriter, controller *http.ResponseCon
 		return
 	}
 
-	fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", name, payload)
-	controller.Flush()
+	_ = writeEvent(writer, controller, fmt.Sprintf("event: %s\ndata: %s\n\n", name, payload))
 }
 
 // handleStreamGenerate handles streaming generation requests using Server's generator.
@@ -72,8 +91,8 @@ func (server *Server) handleStreamGenerate(writer http.ResponseWriter, request *
 
 	controller := http.NewResponseController(writer)
 
-	// commits headers and verifies this writer supports flushing
-	if err := controller.Flush(); err != nil {
+	// commits headers and verifies this writer supports flushing and write deadlines
+	if err := writeEvent(writer, controller, ""); err != nil {
 		slog.Error("streaming unsupported", "error", err)
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
 		return
@@ -116,10 +135,7 @@ func (server *Server) handleStreamGenerate(writer http.ResponseWriter, request *
 			return
 		}
 
-		if _, err := fmt.Fprintf(writer, "data: %s\n\n", payload); err != nil {
-			return
-		}
-		if err := controller.Flush(); err != nil {
+		if err := writeEvent(writer, controller, fmt.Sprintf("data: %s\n\n", payload)); err != nil {
 			return
 		}
 	}
